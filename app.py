@@ -9,7 +9,12 @@ import pandas as pd
 
 from core.enrichment import RefLookup
 from core.matching import best_from_norm_map, similarity, top_n_from_norm_map
-from core.normalization import normalize_country, normalize_district, normalize_region, normalize_town, normalize_empty
+from core.normalization import (
+    normalize_country,
+    normalize_district,
+    normalize_region,
+    normalize_town,
+)
 from core.scoring import ConfidenceInputs, confidence
 
 
@@ -22,6 +27,10 @@ TOWN_CUTOFF = 0.84
 CANDIDATE_MIN_SCORE = 0.78
 AMBIGUITY_GAP_MIN = 0.06  # if gap < this -> ambiguous
 
+# Special handling for "only town" rows (no region, no district)
+ONLY_TOWN_MIN_TOWN_SCORE = 0.84  # accept global town match if town similarity >= this
+ONLY_TOWN_NEAR_EPS = 0.03        # population tie-break window for near-best candidates
+
 
 @dataclass
 class Candidate:
@@ -31,7 +40,6 @@ class Candidate:
     score_region: float
     score_district: float
     score_town: float
-
     @property
     def total(self) -> float:
         # Weighted: region strongest, then town, then district
@@ -54,6 +62,11 @@ def process(
     col_region: str,
     col_district: str,
     col_town: str,
+    REGION_CUTOFF: float,
+    DISTRICT_CUTOFF: float,
+    TOWN_CUTOFF: float,
+    CANDIDATE_MIN_SCORE: float,
+    AMBIGUITY_GAP_MIN: float,
     progress=gr.Progress(track_tqdm=False),
 ) -> Tuple[str, Dict[str, Any]]:
     input_path = _to_input_path(file_obj)
@@ -86,14 +99,12 @@ def process(
             pop_by_rdt[(r, d, t)] = p
 
     # --- Build normalized indices from reference ---
-    # norm -> canon
     region_norm_to_canon: Dict[str, str] = {}
     district_norm_to_canon_by_region: Dict[str, Dict[str, str]] = {}
-    town_norm_to_canon_by_region: Dict[str, Dict[str, str]] = {}
-    town_rows_by_region: Dict[str, List[Tuple[str, str]]] = {}  # region -> list of (district, town)
-    town_rows_by_region_district: Dict[Tuple[str, str], List[str]] = {}  # (region,district) -> towns list
 
-    # Also: global town -> candidates (for when region missing)
+    town_rows_by_region: Dict[str, List[Tuple[str, str]]] = {}  # region -> list of (district, town)
+
+    # Global index: normalized town -> all canonical rows
     town_norm_to_rows_global: Dict[str, List[Tuple[str, str, str]]] = {}  # norm_town -> [(r,d,t)]
 
     for _, rr in ref.iterrows():
@@ -112,12 +123,7 @@ def process(
             district_norm_to_canon_by_region.setdefault(r, {})
             district_norm_to_canon_by_region[r][dn] = d
 
-        if rn and tn:
-            town_norm_to_canon_by_region.setdefault(r, {})
-            town_norm_to_canon_by_region[r][tn] = t
-
         town_rows_by_region.setdefault(r, []).append((d, t))
-        town_rows_by_region_district.setdefault((r, d), []).append(t)
 
         if tn:
             town_norm_to_rows_global.setdefault(tn, []).append((r, d, t))
@@ -168,6 +174,7 @@ def process(
         region_given = region_in is not None
         district_given = district_in is not None
         town_given = town_in is not None
+        only_town_mode = bool(town_in) and (region_in is None) and (district_in is None)
 
         meta_notes: List[str] = []
         meta_actions: List[str] = []
@@ -175,7 +182,6 @@ def process(
 
         # --- country rule: ignore non-Russia ---
         if country_in is not None and country_in != "Россия":
-            # hard ignore
             out = {
                 "out_country": country_in,
                 "out_region": None,
@@ -190,40 +196,42 @@ def process(
                     "status": "ignored",
                     "notes": ["ignored_non_russia"],
                     "actions": [],
-                    "scores": {"best": 0.0, "gap": 0.0},
+                    "scores": {"best": 0.0, "second": 0.0, "gap": 0.0},
+                    "top_candidates": [],
                     "mapping": {
                         "country_col": col_country,
                         "region_col": col_region,
                         "district_col": col_district,
                         "town_col": col_town,
                     },
+                    "tiebreak_by_population": False,
                     **({"missing_input_columns": missing_cols} if missing_cols else {}),
                 },
             }
-            results.append({**in_payload, **out, "log": json.dumps(log_obj, ensure_ascii=False), "confidence": 0.0})
+            results.append(
+                {**in_payload, **out, "log": json.dumps(log_obj, ensure_ascii=False), "confidence": 0.0}
+            )
             progress(i / max(total, 1), desc=f"Обработка: {i}/{total}")
             continue
 
-        # --- Step 1: match region if provided (or if town gives a strong hint later) ---
+        # --- Step 1: match region (if provided) ---
         region_match = best_from_norm_map(region_in, region_norm_to_canon, cutoff=REGION_CUTOFF)
         region_canon = region_match.match if region_match.match else None
         region_matched = region_canon is not None
-        region_was_corrected = (region_in is not None and region_canon is not None and region_canon != region_raw)
 
         # --- Candidate generation ---
         candidates: List[Candidate] = []
 
         if town_in:
-            # If region is matched -> restrict to region candidates first
             if region_canon:
-                # candidates within region, optionally within district if district matched later
+                # candidates within matched region
                 for (d, t) in town_rows_by_region.get(region_canon, []):
-                    score_r = 1.0  # same region by construction
+                    score_r = 1.0
                     score_t = similarity(town_in, normalize_town(t))
                     score_d = similarity(district_in, normalize_district(d)) if district_in else 0.0
                     candidates.append(Candidate(region_canon, d, t, score_r, score_d, score_t))
             else:
-                # no reliable region -> global search by town
+                # global search by town
                 rows = town_norm_to_rows_global.get(town_in, [])
 
                 if rows:
@@ -236,20 +244,16 @@ def process(
                 else:
                     # fuzzy fallback: find closest town keys globally
                     meta_notes.append("global_town_fuzzy_fallback")
-                    # top keys (canonical town values returned as "canonical" here are actually norm keys -> so we pass map norm->norm)
-                    # проще: построим временную карту norm_key -> norm_key
                     norm_keys = list(town_norm_to_rows_global.keys())
                     tmp_map = {k: k for k in norm_keys}
                     top_keys = top_n_from_norm_map(town_in, tmp_map, n=7)  # [(norm_key, score)]
                     for norm_key, sc_key in top_keys:
                         for (r, d, t) in town_norm_to_rows_global.get(norm_key, []):
                             score_r = similarity(region_in, normalize_region(r)) if region_in else 0.0
-                            score_t = sc_key  # близость по ключу
+                            score_t = sc_key
                             score_d = similarity(district_in, normalize_district(d)) if district_in else 0.0
                             candidates.append(Candidate(r, d, t, score_r, score_d, score_t))
-
         else:
-            # no town: we do not guess full triple; we can only validate higher levels
             meta_notes.append("no_town_provided")
             status = "weak"
 
@@ -258,7 +262,7 @@ def process(
             dist_index = district_norm_to_canon_by_region.get(region_canon, {})
             dist_match = best_from_norm_map(district_in, dist_index, cutoff=DISTRICT_CUTOFF)
 
-            # Сужаем кандидаты ТОЛЬКО если уверенно (иначе можно выкинуть правильную строку эталона)
+            # Restrict only if confident
             if dist_match.match and dist_match.score >= DISTRICT_CUTOFF:
                 dcanon = dist_match.match
                 before = len(candidates)
@@ -269,8 +273,8 @@ def process(
                 meta_notes.append("district_not_restricting_candidates_due_to_low_confidence")
 
         # --- Choose best candidate ---
-        best = None
-        second = None
+        best: Optional[Candidate] = None
+        second: Optional[Candidate] = None
         if candidates:
             candidates.sort(key=lambda c: c.total, reverse=True)
             best = candidates[0]
@@ -284,36 +288,52 @@ def process(
         ambiguous = False
         tiebreak_by_population = False
 
+        # homonymy hint for town-only global cases
         if town_in and (not region_canon) and len({(c.region, c.district) for c in candidates}) > 1:
             meta_notes.append("possible_homonymy_town_multiple_regions_or_districts")
 
+        # --- Acceptance logic (main) ---
         if best and best_score >= CANDIDATE_MIN_SCORE:
             if second is not None and gap < AMBIGUITY_GAP_MIN:
-                # ambiguous: try population tie-break among near-best candidates
                 ambiguous = True
                 status = "ambiguous"
                 meta_notes.append("ambiguous_top_candidates_close")
 
-                # candidates within epsilon of the best
-                eps = 0.03
-                near = [c for c in candidates if c.total >= (best_score - eps)]
-
+                # population tie-break among near-best candidates
+                near = [c for c in candidates if c.total >= (best_score - ONLY_TOWN_NEAR_EPS)]
                 if "population" in ref.columns and len(near) > 1:
-                    # choose by population
-                    near.sort(key=lambda c: pop_by_rdt.get((c.region, c.district, c.town), 0.0), reverse=True)
+                    near.sort(
+                        key=lambda c: pop_by_rdt.get((c.region, c.district, c.town), 0.0),
+                        reverse=True,
+                    )
                     chosen = near[0]
                     if chosen != best:
                         best = chosen
                         best_score = best.total
                         tiebreak_by_population = True
                         meta_notes.append("population_tiebreak_applied")
-                # We still keep status ambiguous to be honest, but will output the chosen best row
+
+                if only_town_mode:
+                    meta_notes.append("only_town_global_population_choice")
+
                 accepted = True
             else:
                 accepted = True
                 status = "ok"
         else:
             status = "weak"
+
+        # --- Acceptance override for ONLY_TOWN_MODE ---
+        # If user provided ONLY town (no region, no district) and we have a best candidate,
+        # accept it when town similarity is sufficiently high.
+        if (not accepted) and only_town_mode and best is not None:
+            if best.score_town >= ONLY_TOWN_MIN_TOWN_SCORE:
+                accepted = True
+                meta_notes.append("only_town_override_accept")
+                meta_notes.append("only_town_global_population_choice")
+                # keep status weak to be honest; we still output the chosen best row
+            else:
+                meta_notes.append("only_town_not_accepted_low_town_score")
 
         # --- Build outputs ---
         out_country = country_in or ("Россия" if accepted or region_matched else None)
@@ -328,36 +348,49 @@ def process(
             out_town = best.town
             meta_actions.append("accepted_best_reference_row")
         else:
-            # partial: only keep region if matched well
             if region_matched:
                 out_region = region_canon
                 meta_actions.append("region_validated_only")
-            # district/town left empty to avoid hallucinations
 
         # --- Field validity / corrected flags ---
-        region_is_valid = bool(out_region) and (region_matched or (accepted and best.score_region >= REGION_CUTOFF))
+        region_is_valid = bool(out_region) and (region_matched or (accepted and best and best.score_region >= REGION_CUTOFF))
         district_is_valid = bool(out_district) and accepted
         town_is_valid = bool(out_town) and accepted
 
-        # corrected if output differs from normalized input (or was restored)
-        region_is_corrected = (region_in is None and out_region is not None) or (region_in is not None and out_region is not None and normalize_region(out_region) != region_in)
-        district_is_corrected = (district_in is None and out_district is not None) or (district_in is not None and out_district is not None and normalize_district(out_district) != district_in)
-        town_is_corrected = (town_in is None and out_town is not None) or (town_in is not None and out_town is not None and normalize_town(out_town) != town_in)
+        region_is_corrected = (
+            (region_in is None and out_region is not None)
+            or (region_in is not None and out_region is not None and normalize_region(out_region) != region_in)
+        )
+        district_is_corrected = (
+            (district_in is None and out_district is not None)
+            or (district_in is not None and out_district is not None and normalize_district(out_district) != district_in)
+        )
+        town_is_corrected = (
+            (town_in is None and out_town is not None)
+            or (town_in is not None and out_town is not None and normalize_town(out_town) != town_in)
+        )
 
-        # --- Deterministic enrichment consistency (only if accepted) ---
-        # ensure triple exists (it should, since it's from reference), but keep safety.
+        # --- Deterministic consistency guard ---
         if accepted and best and not ref_lookup.is_consistent(best.region, best.district, best.town):
             status = "weak"
             meta_notes.append("reference_inconsistency_guard_triggered")
             out_region = out_district = out_town = None
             region_is_valid = district_is_valid = town_is_valid = False
+            accepted = False  # also prevent false validity
 
         # --- Log candidates (top-3) for debugging if not ok ---
         top_candidates = []
         if candidates:
             for c in candidates[:3]:
                 top_candidates.append(
-                    {"region": c.region, "district": c.district, "town": c.town, "total": round(c.total, 3)}
+                    {
+                        "region": c.region,
+                        "district": c.district,
+                        "town": c.town,
+                        "total": round(c.total, 3),
+                        "town_score": round(c.score_town, 3),
+                        "population": pop_by_rdt.get((c.region, c.district, c.town), 0.0),
+                    }
                 )
 
         log_obj = {
@@ -438,13 +471,77 @@ with gr.Blocks() as demo:
     col_district = gr.Textbox(label="Наименование поля: Район", placeholder="например: district или Район", value="district")
     col_town = gr.Textbox(label="Наименование поля: Город", placeholder="например: town или Город", value="town")
 
+    with gr.Accordion("Расширенные настройки сопоставления (для опытных пользователей)", open=False):
+        gr.Markdown(
+            """
+            ⚠️ **Внимание:** изменения этих параметров влияют на строгость алгоритма сопоставления  
+            и могут существенно изменить результаты.
+
+            **Общий принцип:**
+            - большее значение → строже (меньше исправлений, больше пропусков)
+            - меньшее значение → мягче (больше исправлений, выше риск ложных совпадений)
+
+            **Рекомендации:**
+            - если данных много и качество среднее → оставьте значения по умолчанию
+            - если данных мало и важна полнота → можно аккуратно снизить пороги
+            - меняйте параметры по одному и анализируйте логи (`log`, `top_candidates`)
+            """
+        )
+
+        ui_region_cutoff = gr.Slider(
+            0.5, 1.0, value=REGION_CUTOFF, step=0.01,
+            label="Порог совпадения региона (REGION_CUTOFF)"
+        )
+        gr.Markdown(
+            "Определяет, насколько строго сопоставляется субъект РФ. "
+            "Рекомендуется менять **крайне редко**."
+        )
+
+        ui_district_cutoff = gr.Slider(
+            0.5, 1.0, value=DISTRICT_CUTOFF, step=0.01,
+            label="Порог совпадения района (DISTRICT_CUTOFF)"
+        )
+        gr.Markdown(
+            "Влияет на распознавание районов и муниципальных округов. "
+            "Снижение может помочь при орфографических ошибках, "
+            "но повышает риск неверной привязки."
+        )
+
+        ui_town_cutoff = gr.Slider(
+            0.5, 1.0, value=TOWN_CUTOFF, step=0.01,
+            label="Порог совпадения населённого пункта (TOWN_CUTOFF)"
+        )
+        gr.Markdown(
+            "Основной параметр для городов и сёл. "
+            "Чаще всего именно его имеет смысл корректировать."
+        )
+
+        ui_candidate_min = gr.Slider(
+            0.5, 1.0, value=CANDIDATE_MIN_SCORE, step=0.01,
+            label="Минимальный итоговый скор кандидата (CANDIDATE_MIN_SCORE)"
+        )
+        gr.Markdown(
+            "Определяет, считается ли найденный вариант приемлемым в целом. "
+            "Снижение увеличивает количество автоматически принятых совпадений."
+        )
+
+        ui_gap_min = gr.Slider(
+            0.0, 0.3, value=AMBIGUITY_GAP_MIN, step=0.01,
+            label="Порог неоднозначности между лучшими вариантами (AMBIGUITY_GAP_MIN)"
+        )
+        gr.Markdown(
+            "Если разница между двумя лучшими вариантами меньше этого значения, "
+            "результат считается неоднозначным и помечается в логах."
+        )
+
     btn = gr.Button("Обработать", variant="primary")
     file_out = gr.File(label="Выходной файл (.xlsx)")
     stats = gr.JSON(label="Статистика выполнения")
 
     btn.click(
         process,
-        inputs=[file_in, col_country, col_region, col_district, col_town],
+        inputs=[file_in, col_country, col_region, col_district, col_town,
+                ui_region_cutoff, ui_district_cutoff, ui_town_cutoff, ui_candidate_min, ui_gap_min],
         outputs=[file_out, stats],
     )
 

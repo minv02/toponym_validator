@@ -51,7 +51,7 @@ def _base_text(s: str) -> str:
 TOWN_TYPE_TOKENS = [
     # базовые (как в примере)
     "город", "г.",
-    "село",
+    "село", "с.",
     "деревня",
     "поселок", "посёлок",
     "пгт",
@@ -145,15 +145,14 @@ def normalize_district(value: Any) -> Optional[str]:
 
 
 def normalize_town(value: Any) -> Optional[str]:
-    """
-    Normalize town:
-    - base normalize
-    - remove town-type tokens (г., с., д., пгт...) as separate words
-    """
     v = normalize_empty(value)
     if v is None:
         return None
     s = _base_text(v)
+
+    # ✅ НОВОЕ: вырезаем уточнения в скобках
+    s = re.sub(r"\([^)]*\)", " ", s)
+
     s = re.sub(r"[.,;:()\"']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
