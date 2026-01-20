@@ -1,62 +1,66 @@
 """
-Нечёткое сопоставление топонимов.
+Инструменты для fuzzy matching.
 
-Используется rapidfuzz:
-- token_sort_ratio
-
-Важно:
-- функции возвращают не только match, но и score (0..1)
-- пороги score_cutoff задаются снаружи (для региона/района/НП могут отличаться)
+Важное правило проекта:
+matching НЕ принимает решений "что исправлять".
+Он только считает похожесть и выбирает кандидатов.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from rapidfuzz import fuzz, process
 
 
 @dataclass(frozen=True)
 class MatchResult:
-    """Result of fuzzy matching against a choice list."""
-    match: Optional[str]
-    score: float  # 0..1
-
-    @property
-    def is_match(self) -> bool:
-        return self.match is not None and self.score > 0.0
+    match: Optional[str]         # canonical value
+    score: float                 # 0..1
+    best_norm_key: Optional[str] # key in dict if applicable
 
 
-def best_match(
-    query: Optional[str],
-    choices: List[str],
-    score_cutoff: int = 80,
-) -> Tuple[Optional[str], float]:
-    """
-    Backward-compatible helper.
-
-    Returns:
-        (best_choice or None, score in 0..1)
-    """
-    if query is None or not choices:
-        return None, 0.0
-    m = process.extractOne(
-        query,
-        choices,
-        scorer=fuzz.token_sort_ratio,
-        score_cutoff=score_cutoff,
-    )
-    if m is None:
-        return None, 0.0
-    return m[0], m[1] / 100.0
+def similarity(a: Optional[str], b: Optional[str]) -> float:
+    """Similarity 0..1 using WRatio; None -> 0."""
+    if not a or not b:
+        return 0.0
+    return fuzz.WRatio(a, b) / 100.0
 
 
-def best_match_r(
-    query: Optional[str],
-    choices: List[str],
-    score_cutoff: int = 80,
+def best_from_norm_map(
+    query_norm: Optional[str],
+    norm_to_canon: Dict[str, str],
+    cutoff: float,
 ) -> MatchResult:
-    """Typed wrapper returning MatchResult."""
-    m, s = best_match(query=query, choices=choices, score_cutoff=score_cutoff)
-    return MatchResult(match=m, score=s)
+    """
+    Match query (normalized) against keys of norm_to_canon and return canonical.
+    cutoff: 0..1
+    """
+    if not query_norm or not norm_to_canon:
+        return MatchResult(None, 0.0, None)
+
+    keys = list(norm_to_canon.keys())
+    m = process.extractOne(query_norm, keys, scorer=fuzz.WRatio, score_cutoff=int(cutoff * 100))
+    if not m:
+        return MatchResult(None, 0.0, None)
+
+    norm_key = m[0]
+    score = m[1] / 100.0
+    return MatchResult(norm_to_canon[norm_key], score, norm_key)
+
+
+def top_n_from_norm_map(
+    query_norm: Optional[str],
+    norm_to_canon: Dict[str, str],
+    n: int = 5,
+) -> List[Tuple[str, float]]:
+    """Return top-N canonical candidates with scores (0..1)."""
+    if not query_norm or not norm_to_canon:
+        return []
+    keys = list(norm_to_canon.keys())
+    matches = process.extract(query_norm, keys, scorer=fuzz.WRatio, limit=n)
+    out: List[Tuple[str, float]] = []
+    for norm_key, sc, _ in matches:
+        out.append((norm_to_canon[norm_key], sc / 100.0))
+    return out
