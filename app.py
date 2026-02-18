@@ -39,7 +39,7 @@ def _clean_colname(name: Any) -> str:
 
 
 def _is_missing(v: Any) -> bool:
-    """Robust missing detection for raw values (None, NaN, '', whitespace)."""
+    """Robust missing detection for raw values (None, NaN/NA, '', whitespace)."""
     if v is None:
         return True
     try:
@@ -53,7 +53,10 @@ def _is_missing(v: Any) -> bool:
 
 
 def _apply_missing(v: Any, fill_missing: bool, missing_value: str) -> Any:
-    """If fill_missing enabled, replace missing-like values with missing_value; else keep empty (None)."""
+    """
+    If fill_missing enabled, replace missing-like values with missing_value.
+    If disabled, keep missing as empty (None), so Excel cell remains empty.
+    """
     if not fill_missing:
         return None if _is_missing(v) else v
     return missing_value if _is_missing(v) else v
@@ -224,6 +227,60 @@ def process(
         district_raw = get_val(raw_row, col_district)
         town_raw = get_val(raw_row, col_town)
 
+        # === RULE: if whole row empty -> do not fill with missing_value ===
+        whole_row_empty = (
+            _is_missing(country_raw)
+            and _is_missing(region_raw)
+            and _is_missing(district_raw)
+            and _is_missing(town_raw)
+        )
+        if whole_row_empty:
+            log_obj = {
+                "region": {"is_valid": False, "is_corrected": False},
+                "district": {"is_valid": False, "is_corrected": False},
+                "town": {"is_valid": False, "is_corrected": False},
+                "_meta": {
+                    "status": "empty_row_passthrough",
+                    "notes": ["row_is_empty_no_filling_applied"],
+                    "actions": [],
+                    "scores": {"best": 0.0, "second": 0.0, "gap": 0.0},
+                    "top_candidates": [],
+                    "mapping": {
+                        "country_col": col_country,
+                        "region_col": col_region,
+                        "district_col": col_district,
+                        "town_col": col_town,
+                    },
+                    "fill_missing": fill_missing,
+                    "missing_value": missing_value,
+                    "params": {
+                        "region_cutoff": region_cutoff,
+                        "district_cutoff": district_cutoff,
+                        "town_cutoff": town_cutoff,
+                        "candidate_min_score": candidate_min_score,
+                        "ambiguity_gap_min": ambiguity_gap_min,
+                    },
+                    **({"missing_input_columns": missing_cols} if missing_cols else {}),
+                },
+            }
+            results.append(
+                {
+                    **in_payload,
+                    "out_country": None,
+                    "out_region": None,
+                    "out_district": None,
+                    "out_town": None,
+                    "out_town_type": None,
+                    "out_population": None,
+                    "candidates": "[]",
+                    "log": json.dumps(log_obj, ensure_ascii=False),
+                    "confidence": 0.0,
+                }
+            )
+            progress(i / max(total, 1), desc=f"Обработка: {i}/{total}")
+            continue
+
+        # normalize inputs
         country_in = normalize_country(country_raw)
         region_in = normalize_region(region_raw)
         district_in = normalize_district(district_raw)
@@ -239,12 +296,18 @@ def process(
         status = "ok"
         tiebreak_by_population = False
 
+        # fill_missing can be disabled per-row by rules:
+        # RULE: if country explicitly not Russia -> do not fill
+        fill_missing_effective = fill_missing
+        if country_in is not None and country_in != "Россия":
+            fill_missing_effective = False
+
         # ---- non-Russia passthrough ----
         if country_in is not None and country_in != "Россия":
-            out_country = _apply_missing(country_raw, fill_missing, missing_value)
-            out_region = _apply_missing(region_raw, fill_missing, missing_value)
-            out_district = _apply_missing(district_raw, fill_missing, missing_value)
-            out_town = _apply_missing(town_raw, fill_missing, missing_value)
+            out_country = _apply_missing(country_raw, fill_missing_effective, missing_value)
+            out_region = _apply_missing(region_raw, fill_missing_effective, missing_value)
+            out_district = _apply_missing(district_raw, fill_missing_effective, missing_value)
+            out_town = _apply_missing(town_raw, fill_missing_effective, missing_value)
 
             log_obj = {
                 "region": {"is_valid": False, "is_corrected": False},
@@ -252,7 +315,10 @@ def process(
                 "town": {"is_valid": False, "is_corrected": False},
                 "_meta": {
                     "status": "non_russia_passthrough",
-                    "notes": ["non_russia_passthrough_return_original_fields"],
+                    "notes": [
+                        "non_russia_passthrough_return_original_fields",
+                        "missing_fill_disabled_for_non_russia",
+                    ],
                     "actions": [],
                     "scores": {"best": 0.0, "second": 0.0, "gap": 0.0},
                     "top_candidates": [],
@@ -263,6 +329,7 @@ def process(
                         "town_col": col_town,
                     },
                     "fill_missing": fill_missing,
+                    "fill_missing_effective": fill_missing_effective,
                     "missing_value": missing_value,
                     "params": {
                         "region_cutoff": region_cutoff,
@@ -318,15 +385,20 @@ def process(
 
             meta_actions.append("region_corrected_or_validated" if out_region else "region_missing_or_not_matched")
 
-            # apply missing policy
-            out_country = _apply_missing(out_country, fill_missing, missing_value)
-            out_region = _apply_missing(out_region, fill_missing, missing_value)
-            out_district = _apply_missing(out_district, fill_missing, missing_value)
-            out_town = _apply_missing(out_town, fill_missing, missing_value)
+            out_country = _apply_missing(out_country, fill_missing_effective, missing_value)
+            out_region = _apply_missing(out_region, fill_missing_effective, missing_value)
+            out_district = _apply_missing(out_district, fill_missing_effective, missing_value)
+            out_town = _apply_missing(out_town, fill_missing_effective, missing_value)
 
             log_obj = {
-                "region": {"is_valid": bool(region_matched), "is_corrected": bool(region_matched and region_in and normalize_region(region_canon) != region_in)},
-                "district": {"is_valid": bool(out_district and (not fill_missing or out_district != missing_value)), "is_corrected": bool(out_district)},
+                "region": {
+                    "is_valid": bool(region_matched),
+                    "is_corrected": bool(region_matched and region_in and normalize_region(region_canon) != region_in),
+                },
+                "district": {
+                    "is_valid": bool(out_district and (not fill_missing_effective or out_district != missing_value)),
+                    "is_corrected": bool(out_district),
+                },
                 "town": {"is_valid": False, "is_corrected": False},
                 "_meta": {
                     "status": "russia_no_town_mode",
@@ -341,6 +413,7 @@ def process(
                         "town_col": col_town,
                     },
                     "fill_missing": fill_missing,
+                    "fill_missing_effective": fill_missing_effective,
                     "missing_value": missing_value,
                     "params": {
                         "region_cutoff": region_cutoff,
@@ -361,7 +434,7 @@ def process(
                     district_given=district_given,
                     town_given=town_given,
                     region_matched=bool(region_matched),
-                    district_matched=bool(out_district and (not fill_missing or out_district != missing_value)),
+                    district_matched=bool(out_district and (not fill_missing_effective or out_district != missing_value)),
                     town_matched=False,
                     status="weak",
                 )
@@ -433,7 +506,7 @@ def process(
         if candidates:
             candidates.sort(key=lambda c: c.total, reverse=True)
 
-        # ---- max-score tie => outputs must be literally empty (None), regardless of fill_missing ----
+        # ---- max-score tie => outputs empty (None), regardless of fill_missing_effective ----
         tie_list = _max_tie_candidates(candidates, pop_by_rdt, town_type_by_rdt)
         if tie_list:
             log_obj = {
@@ -457,6 +530,7 @@ def process(
                         "town_col": col_town,
                     },
                     "fill_missing": fill_missing,
+                    "fill_missing_effective": fill_missing_effective,
                     "missing_value": missing_value,
                     "params": {
                         "region_cutoff": region_cutoff,
@@ -525,7 +599,13 @@ def process(
 
         # ---- outputs: do NOT erase raw town/district if not accepted ----
         if accepted and best:
-            out_country = country_in or ("Россия" if (region_matched or is_russia_context) else None)
+            # NEW RULE: if country was missing but we accepted a reference candidate => restore to "Россия"
+            if country_in is None:
+                out_country = "Россия"
+                meta_actions.append("country_restored_to_russia_by_accepted_candidate")
+            else:
+                out_country = country_in
+
             out_region = best.region
             out_district = best.district
             out_town = best.town
@@ -548,21 +628,22 @@ def process(
             status = "weak"
             meta_notes.append("reference_inconsistency_guard_triggered")
             accepted = False
+            out_country = country_in or ("Россия" if (region_matched or is_russia_context) else None)
             out_region = region_canon if region_matched else region_raw
             out_district = district_raw
             out_town = town_raw
             out_town_type = None
             out_population = None
 
-        # missing policy applied to normal branches only
-        out_country = _apply_missing(out_country, fill_missing, missing_value)
-        out_region = _apply_missing(out_region, fill_missing, missing_value)
-        out_district = _apply_missing(out_district, fill_missing, missing_value)
-        out_town = _apply_missing(out_town, fill_missing, missing_value)
+        # missing policy applied to normal branches only (effective)
+        out_country = _apply_missing(out_country, fill_missing_effective, missing_value)
+        out_region = _apply_missing(out_region, fill_missing_effective, missing_value)
+        out_district = _apply_missing(out_district, fill_missing_effective, missing_value)
+        out_town = _apply_missing(out_town, fill_missing_effective, missing_value)
 
-        region_is_valid = bool(out_region) and (not fill_missing or out_region != missing_value)
-        district_is_valid = accepted and bool(out_district) and (not fill_missing or out_district != missing_value)
-        town_is_valid = accepted and bool(out_town) and (not fill_missing or out_town != missing_value)
+        region_is_valid = bool(out_region) and (not fill_missing_effective or out_region != missing_value)
+        district_is_valid = accepted and bool(out_district) and (not fill_missing_effective or out_district != missing_value)
+        town_is_valid = accepted and bool(out_town) and (not fill_missing_effective or out_town != missing_value)
 
         region_is_corrected = bool(region_in and out_region and normalize_region(out_region) != region_in)
         district_is_corrected = bool(district_in and out_district and normalize_district(out_district) != district_in)
@@ -601,6 +682,7 @@ def process(
                 },
                 "tiebreak_by_population": tiebreak_by_population,
                 "fill_missing": fill_missing,
+                "fill_missing_effective": fill_missing_effective,
                 "missing_value": missing_value,
                 "params": {
                     "region_cutoff": region_cutoff,
@@ -656,7 +738,7 @@ def process(
     return out_path, stats
 
 
-# ---------------- UI  ----------------
+# ---------------- UI (вид и порядок сохраняем) ----------------
 with gr.Blocks() as demo:
     gr.Markdown(
         "### Валидация и обогащение мест рождения (РФ)\n"
@@ -695,8 +777,12 @@ with gr.Blocks() as demo:
         gr.Markdown(
             """
             Если включено — пустые значения в `out_*` будут заменены на указанную строку.
-            ⚠️ Исключение: когда найдено несколько кандидатов с одинаковым максимальным скором (`candidates` не пустой),
-            выходные `out_*` намеренно остаются пустыми.
+
+            **Исключения:**
+            1) Если `country` явно не Россия → строка passthrough, пропуски НЕ заполняются.
+            2) Если все поля (country/region/district/town) пустые → пропуски НЕ заполняются.
+            3) Если `candidates` не пустой (tie max-score) → `out_*` остаются пустыми.
+            4) Если `country` был пустой, но выбран лучший кандидат из справочника → `out_country` восстанавливается как "Россия".
             """
         )
         fill_missing = gr.Checkbox(label="Заполнить пропуски", value=True)
